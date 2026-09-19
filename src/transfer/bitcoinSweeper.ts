@@ -1,9 +1,18 @@
 import axios, { AxiosInstance } from 'axios';
+import { BIP32Interface } from 'bip32';
 import * as bitcoin from 'bitcoinjs-lib';
-import { ECPairFactory, ECPairInterface } from 'ecpair';
+import { ECPairFactory } from 'ecpair';
 import * as ecc from 'tiny-secp256k1';
 import { scaleUnits } from '../chains/evm';
 import { PriceService } from '../pricing/priceService';
+import {
+  BITCOIN_PURPOSES,
+  DEFAULT_GAP_LIMIT,
+  addressForScriptType,
+  deriveBitcoinKey,
+  mnemonicToSeed,
+  rootFromSeed,
+} from './hdWallet';
 import {
   ExecutedTransfer,
   MIN_VALUE_THRESHOLD_USD,
@@ -73,7 +82,33 @@ export interface BitcoinSweepOptions extends SweepOptions {
    * still be replaced, which would invalidate the sweep.
    */
   includeUnconfirmed?: boolean;
+  /** Seed-phrase mode: consecutive unused addresses that end a scan. */
+  gapLimit?: number;
+  /** Seed-phrase mode: which account to scan. Wallets show account 0. */
+  account?: number;
 }
+
+/**
+ * Anything that can sign an input.
+ *
+ * Both a standalone keypair and a derived BIP32 node satisfy this, which is
+ * what lets one transaction mix inputs from a single imported key with inputs
+ * from a whole derived account.
+ */
+export interface SweepSigner {
+  publicKey: Buffer;
+  sign(hash: Buffer, lowR?: boolean): Buffer;
+}
+
+interface KnownAddress {
+  scriptType: BitcoinScriptType;
+  signer: SweepSigner;
+  /** Derivation path, when the address came from a seed phrase. */
+  path?: string;
+}
+
+/** Stops a malformed scan from walking forever. */
+const MAX_SCAN_INDEX = 500;
 
 /**
  * Consolidates every UTXO a key controls into a single payment.
@@ -83,7 +118,12 @@ export interface BitcoinSweepOptions extends SweepOptions {
  * change output -- the whole balance moves by construction.
  */
 export class BitcoinSweeper {
-  private readonly keyPair: ECPairInterface;
+  /** Addresses discovered so far, and how to sign for each. */
+  private readonly known = new Map<string, KnownAddress>();
+
+  private readonly root?: BIP32Interface;
+  private readonly account: number;
+  private readonly gapLimit: number;
   private readonly endpoints: string[];
   private readonly http: AxiosInstance;
   private readonly prices: PriceService;
@@ -92,8 +132,10 @@ export class BitcoinSweeper {
   private readonly includeUnconfirmed: boolean;
   private readonly feeRateOverride?: number;
 
-  constructor(wif: string, options: BitcoinSweepOptions = {}) {
-    this.keyPair = ECPair.fromWIF(wif.trim(), bitcoin.networks.bitcoin);
+  private constructor(root: BIP32Interface | undefined, options: BitcoinSweepOptions) {
+    this.root = root;
+    this.account = options.account ?? 0;
+    this.gapLimit = options.gapLimit ?? DEFAULT_GAP_LIMIT;
     this.endpoints = options.endpoints ?? DEFAULT_ENDPOINTS;
     this.http = axios.create({ timeout: 20000 });
     this.prices = PriceService.getInstance();
@@ -103,33 +145,66 @@ export class BitcoinSweeper {
     this.feeRateOverride = options.feeRate;
   }
 
-  /** Every address this key can spend from, by script type. */
-  addresses(): Array<{ scriptType: BitcoinScriptType; address: string }> {
-    const pubkey = Buffer.from(this.keyPair.publicKey);
-    const network = bitcoin.networks.bitcoin;
+  /**
+   * One imported key, in all three of the address forms it can take.
+   *
+   * This covers a key exported from a wallet, but only the single address that
+   * key controls -- see `fromMnemonic` for an HD wallet.
+   */
+  static fromWif(wif: string, options: BitcoinSweepOptions = {}): BitcoinSweeper {
+    const sweeper = new BitcoinSweeper(undefined, options);
+    const keyPair = ECPair.fromWIF(wif.trim(), bitcoin.networks.bitcoin);
+    const pubkey = Buffer.from(keyPair.publicKey);
+    const signer: SweepSigner = { publicKey: pubkey, sign: (hash, lowR) => Buffer.from(keyPair.sign(hash, lowR)) };
 
-    const p2wpkh = bitcoin.payments.p2wpkh({ pubkey, network });
-    const p2pkh = bitcoin.payments.p2pkh({ pubkey, network });
-    const p2sh = bitcoin.payments.p2sh({ redeem: p2wpkh, network });
+    for (const scriptType of ['p2wpkh', 'p2sh-p2wpkh', 'p2pkh'] as const) {
+      sweeper.known.set(addressForScriptType(pubkey, scriptType), { scriptType, signer });
+    }
 
-    return [
-      { scriptType: 'p2wpkh', address: p2wpkh.address! },
-      { scriptType: 'p2sh-p2wpkh', address: p2sh.address! },
-      { scriptType: 'p2pkh', address: p2pkh.address! },
-    ];
+    return sweeper;
+  }
+
+  /**
+   * A whole HD account, derived from a seed phrase.
+   *
+   * Addresses are discovered by scanning, not assumed, so change outputs -- the
+   * ones a single exported key misses -- are swept along with everything else.
+   */
+  static fromMnemonic(mnemonic: string, passphrase = '', options: BitcoinSweepOptions = {}): BitcoinSweeper {
+    return new BitcoinSweeper(rootFromSeed(mnemonicToSeed(mnemonic, passphrase)), options);
+  }
+
+  /** True when this sweeper discovers addresses by derivation rather than holding one key. */
+  get isHd(): boolean {
+    return this.root !== undefined;
+  }
+
+  /** Addresses known to hold, or have held, funds. Populated by a scan in HD mode. */
+  addresses(): Array<{ scriptType: BitcoinScriptType; address: string; path?: string }> {
+    return [...this.known.entries()].map(([address, entry]) => ({
+      address,
+      scriptType: entry.scriptType,
+      path: entry.path,
+    }));
   }
 
   async planSweep(destination: string): Promise<SweepPlan> {
+    const utxos = await this.collectUtxos();
+
+    // In HD mode the address set is only known after the scan, so the
+    // self-send check has to come after it.
     const to = normalizeBitcoinDestination(
       destination,
       this.addresses().map((entry) => entry.address)
     );
-    const utxos = await this.collectUtxos();
 
     if (utxos.length === 0) {
       throw new Error(
-        `No ${this.includeUnconfirmed ? '' : 'confirmed '}outputs found for this key across ` +
-          this.addresses().map((entry) => entry.address).join(', ')
+        this.isHd
+          ? `No ${this.includeUnconfirmed ? '' : 'confirmed '}outputs found across account ${this.account} ` +
+            `(scanned BIP84, BIP49 and BIP44, receive and change, gap limit ${this.gapLimit}).`
+          : `No ${this.includeUnconfirmed ? '' : 'confirmed '}outputs found for this key across ` +
+            this.addresses().map((entry) => entry.address).join(', ')
       );
     }
 
@@ -168,7 +243,16 @@ export class BitcoinSweeper {
 
     const spread = new Set(utxos.map((utxo) => utxo.address));
     if (spread.size > 1) {
-      warnings.push(`This key holds funds under ${spread.size} script types; all are being swept into one transaction.`);
+      warnings.push(
+        this.isHd
+          ? `Funds found across ${spread.size} derived addresses; all are being swept into one transaction.`
+          : `This key holds funds under ${spread.size} script types; all are being swept into one transaction.`
+      );
+    }
+    if (this.isHd) {
+      warnings.push(
+        `Only account ${this.account} was scanned. If this wallet uses further accounts, their funds are not included.`
+      );
     }
     if (!this.includeUnconfirmed) {
       warnings.push('Unconfirmed outputs are excluded. Re-run with --include-unconfirmed to spend them too.');
@@ -210,14 +294,18 @@ export class BitcoinSweeper {
 
       const prevTxs = await this.fetchParentTransactions(utxos);
       const psbt = buildSweepPsbt(
-        Buffer.from(this.keyPair.publicKey),
         utxos,
         plan.destination,
         transfer.rawAmount,
-        prevTxs
+        prevTxs,
+        (address) => this.signerFor(address).publicKey
       );
 
-      psbt.signAllInputs(this.keyPair);
+      // Inputs can come from different derived keys, so each is signed with
+      // the one that controls its address rather than a single wallet key.
+      utxos.forEach((utxo, index) => {
+        psbt.signInput(index, this.signerFor(utxo.address));
+      });
       psbt.finalizeAllInputs();
 
       const hex = psbt.extractTransaction().toHex();
@@ -261,25 +349,89 @@ export class BitcoinSweeper {
     return parents;
   }
 
-  /** Gather spendable outputs across every script type this key controls. */
+  private signerFor(address: string): SweepSigner {
+    const entry = this.known.get(address);
+    if (!entry) {
+      throw new Error(`No key available for ${address}; refusing to sign.`);
+    }
+    return entry.signer;
+  }
+
+  /** Gather spendable outputs from every address this wallet controls. */
   private async collectUtxos(): Promise<SweepableUtxo[]> {
+    if (this.root) {
+      return this.scanHdAccount(this.root);
+    }
+
+    const collected: SweepableUtxo[] = [];
+    for (const { scriptType, address } of this.addresses()) {
+      collected.push(...(await this.utxosAt(address, scriptType)));
+    }
+    return collected;
+  }
+
+  /**
+   * Walk every standard chain of the account, stopping each one after
+   * `gapLimit` consecutive unused addresses.
+   *
+   * Emptiness is judged by transaction history rather than current balance: an
+   * address that was used and spent still means later indices may hold funds,
+   * and treating it as unused would end the scan early and strand them.
+   */
+  private async scanHdAccount(root: BIP32Interface): Promise<SweepableUtxo[]> {
     const collected: SweepableUtxo[] = [];
 
-    for (const { scriptType, address } of this.addresses()) {
-      const utxos = await this.fetchUtxos(address);
-      for (const utxo of utxos) {
-        if (!this.includeUnconfirmed && !utxo.status?.confirmed) continue;
-        collected.push({
-          txid: utxo.txid,
-          vout: utxo.vout,
-          value: BigInt(utxo.value),
-          scriptType,
-          address,
-        });
+    for (const { purpose } of BITCOIN_PURPOSES) {
+      for (const change of [0, 1] as const) {
+        let unusedRun = 0;
+
+        for (let index = 0; unusedRun < this.gapLimit && index < MAX_SCAN_INDEX; index++) {
+          const derived = deriveBitcoinKey(root, purpose, this.account, change, index);
+
+          if ((await this.fetchTransactionCount(derived.address)) === 0) {
+            unusedRun++;
+            continue;
+          }
+
+          unusedRun = 0;
+          this.known.set(derived.address, {
+            scriptType: derived.scriptType,
+            path: derived.path,
+            signer: {
+              publicKey: Buffer.from(derived.node.publicKey),
+              sign: (hash, lowR) => Buffer.from(derived.node.sign(hash, lowR)),
+            },
+          });
+
+          collected.push(...(await this.utxosAt(derived.address, derived.scriptType)));
+        }
       }
     }
 
     return collected;
+  }
+
+  private async utxosAt(address: string, scriptType: BitcoinScriptType): Promise<SweepableUtxo[]> {
+    const utxos = await this.fetchUtxos(address);
+    const spendable: SweepableUtxo[] = [];
+
+    for (const utxo of utxos) {
+      if (!this.includeUnconfirmed && !utxo.status?.confirmed) continue;
+      spendable.push({ txid: utxo.txid, vout: utxo.vout, value: BigInt(utxo.value), scriptType, address });
+    }
+
+    return spendable;
+  }
+
+  /** Total transactions an address has ever appeared in, confirmed or pending. */
+  private async fetchTransactionCount(address: string): Promise<number> {
+    return this.tryEndpoints(async (endpoint) => {
+      const response = await this.http.get<{
+        chain_stats?: { tx_count?: number };
+        mempool_stats?: { tx_count?: number };
+      }>(`${endpoint}/address/${address}`);
+      return (response.data?.chain_stats?.tx_count ?? 0) + (response.data?.mempool_stats?.tx_count ?? 0);
+    }, `Could not read history for ${address}`);
   }
 
   private async btcPrice(): Promise<number | null> {
@@ -387,15 +539,14 @@ export function normalizeBitcoinDestination(destination: string, ownAddresses: s
  * built and inspected in a test with nothing but a keypair.
  */
 export function buildSweepPsbt(
-  pubkey: Buffer,
   utxos: SweepableUtxo[],
   destination: string,
   amount: bigint,
-  parentTransactions: Map<string, Buffer>
+  parentTransactions: Map<string, Buffer>,
+  pubkeyFor: (address: string) => Buffer
 ): bitcoin.Psbt {
   const network = bitcoin.networks.bitcoin;
   const psbt = new bitcoin.Psbt({ network });
-  const p2wpkh = bitcoin.payments.p2wpkh({ pubkey, network });
 
   for (const utxo of utxos) {
     const base = { hash: utxo.txid, index: utxo.vout };
@@ -408,6 +559,10 @@ export function buildSweepPsbt(
       psbt.addInput({ ...base, nonWitnessUtxo: parent });
       continue;
     }
+
+    // Each input's scripts are built from the key that controls its own
+    // address, which need not be the same key across inputs.
+    const p2wpkh = bitcoin.payments.p2wpkh({ pubkey: pubkeyFor(utxo.address), network });
 
     if (utxo.scriptType === 'p2sh-p2wpkh') {
       const p2sh = bitcoin.payments.p2sh({ redeem: p2wpkh, network });

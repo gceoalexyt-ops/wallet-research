@@ -15,7 +15,15 @@ import {
 import { Transaction, Wallet, recoverAddress } from 'ethers';
 import { buildNativeTransfer, normalizeEvmDestination, normalizePrivateKey } from '../transfer/evmSweeper';
 import { SweepCandidate, SweepPlan, classifyAssets, withBuffer } from '../transfer/types';
-import { renderPlan } from '../transfer/sweepCli';
+import { looksLikeMnemonic, renderPlan } from '../transfer/sweepCli';
+import {
+  deriveBitcoinKey,
+  deriveEvmKey,
+  enumerateBitcoinCandidates,
+  mnemonicToSeed,
+  normalizeMnemonic,
+  rootFromSeed,
+} from '../transfer/hdWallet';
 
 const ECPair = ECPairFactory(ecc);
 
@@ -147,7 +155,7 @@ test('a native sweep signs into a transaction that recovers to the source wallet
 });
 
 test('BitcoinSweeper derives every script type a key can spend from', () => {
-  const sweeper = new BitcoinSweeper(WIF_KEY_ONE);
+  const sweeper = BitcoinSweeper.fromWif(WIF_KEY_ONE);
   const derived = sweeper.addresses();
 
   assert.deepEqual(
@@ -162,7 +170,7 @@ test('BitcoinSweeper derives every script type a key can spend from', () => {
 });
 
 test('normalizeBitcoinDestination rejects malformed, testnet and self-directed addresses', () => {
-  const own = new BitcoinSweeper(WIF_KEY_ONE).addresses().map((entry) => entry.address);
+  const own = BitcoinSweeper.fromWif(WIF_KEY_ONE).addresses().map((entry) => entry.address);
 
   assert.equal(normalizeBitcoinDestination(DEST_BECH32, own), DEST_BECH32);
   assert.equal(normalizeBitcoinDestination(`  ${DEST_BECH32}  `, own), DEST_BECH32);
@@ -217,7 +225,7 @@ test('buildSweepPsbt produces a signable transaction spending every input', () =
   const vsize = estimateVsize(utxos.map((utxo) => utxo.scriptType), outputTypeOf(DEST_BECH32));
   const { amount } = computeSweepAmount(100_000n, vsize, 10);
 
-  const psbt = buildSweepPsbt(pubkey, utxos, DEST_BECH32, amount, new Map());
+  const psbt = buildSweepPsbt(utxos, DEST_BECH32, amount, new Map(), () => pubkey);
   psbt.signAllInputs(keyPair);
 
   assert.ok(psbt.validateSignaturesOfAllInputs(validator), 'every input should carry a valid signature');
@@ -254,7 +262,7 @@ test('buildSweepPsbt signs a legacy input from its parent transaction', () => {
   const vsize = estimateVsize(['p2pkh'], outputTypeOf(DEST_BECH32));
   const { amount } = computeSweepAmount(50_000n, vsize, 5);
 
-  const psbt = buildSweepPsbt(pubkey, utxos, DEST_BECH32, amount, new Map([[parent.getId(), parentHex]]));
+  const psbt = buildSweepPsbt(utxos, DEST_BECH32, amount, new Map([[parent.getId(), parentHex]]), () => pubkey);
   psbt.signAllInputs(keyPair);
   assert.ok(psbt.validateSignaturesOfAllInputs(validator));
 
@@ -272,7 +280,7 @@ test('buildSweepPsbt refuses a legacy input with no parent transaction', () => {
   ];
 
   assert.throws(
-    () => buildSweepPsbt(Buffer.from(keyPair.publicKey), utxos, DEST_BECH32, 40_000n, new Map()),
+    () => buildSweepPsbt(utxos, DEST_BECH32, 40_000n, new Map(), () => Buffer.from(keyPair.publicKey)),
     /Missing parent transaction/
   );
 });
@@ -316,3 +324,127 @@ test('renderPlan shows what moves, what stays and the fee reserve', () => {
 function validator(pubkey: Buffer, msghash: Buffer, signature: Buffer): boolean {
   return ECPair.fromPublicKey(pubkey).verify(msghash, signature);
 }
+
+// --- HD wallet derivation -------------------------------------------------
+
+/** The BIP39 all-zero-entropy phrase, used by the BIP49/84 specs themselves. */
+const TEST_MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
+test('derivation matches the published BIP84, BIP49 and BIP44 vectors', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+
+  // These three are the test vectors in the BIP84 specification itself.
+  assert.equal(deriveBitcoinKey(root, 84, 0, 0, 0).address, 'bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu');
+  assert.equal(deriveBitcoinKey(root, 84, 0, 0, 1).address, 'bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g');
+  assert.equal(deriveBitcoinKey(root, 84, 0, 1, 0).address, 'bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el');
+
+  assert.equal(deriveBitcoinKey(root, 49, 0, 0, 0).address, '37VucYSaXLCAsxYyAPfbSi9eh4iEcbShgf');
+  assert.equal(deriveBitcoinKey(root, 44, 0, 0, 0).address, '1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA');
+
+  // The address every wallet shows first for this phrase.
+  assert.equal(deriveEvmKey(root, 0).address, '0x9858EfFD232B4033E47d90003D41EC34EcaEda94');
+  assert.equal(deriveEvmKey(root, 0).path, "m/44'/60'/0'/0/0");
+});
+
+test('each purpose derives its own script type, not just its own key', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+
+  assert.equal(deriveBitcoinKey(root, 84, 0, 0, 0).scriptType, 'p2wpkh');
+  assert.equal(deriveBitcoinKey(root, 49, 0, 0, 0).scriptType, 'p2sh-p2wpkh');
+  assert.equal(deriveBitcoinKey(root, 44, 0, 0, 0).scriptType, 'p2pkh');
+  assert.throws(() => deriveBitcoinKey(root, 86, 0, 0, 0), /Unsupported derivation purpose/);
+});
+
+test('normalizeMnemonic accepts sloppy spacing and rejects a broken checksum', () => {
+  assert.equal(normalizeMnemonic(`  ${TEST_MNEMONIC.toUpperCase()}  `), TEST_MNEMONIC);
+  assert.equal(normalizeMnemonic(TEST_MNEMONIC.replace(/ /g, '   ')), TEST_MNEMONIC);
+
+  // Valid words, wrong checksum -- the common "one word misremembered" case.
+  const wrongChecksum = TEST_MNEMONIC.replace(/about$/, 'abandon');
+  assert.throws(() => normalizeMnemonic(wrongChecksum), /checksum/);
+
+  assert.throws(() => normalizeMnemonic('abandon abandon about'), /12, 15, 18, 21 or 24 words/);
+  assert.throws(() => normalizeMnemonic(''), /No seed phrase/);
+  // A word outside the BIP39 list.
+  assert.throws(() => normalizeMnemonic(TEST_MNEMONIC.replace(/^abandon/, 'zzzzzz')), /checksum|wordlist/);
+});
+
+test('a BIP39 passphrase derives a completely different wallet', () => {
+  const plain = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+  const guarded = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC, 'correct horse'));
+
+  assert.notEqual(deriveBitcoinKey(guarded, 84, 0, 0, 0).address, deriveBitcoinKey(plain, 84, 0, 0, 0).address);
+  assert.notEqual(deriveEvmKey(guarded, 0).address, deriveEvmKey(plain, 0).address);
+});
+
+test('a scan covers the change chain, which is what a single key misses', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+  const candidates = enumerateBitcoinCandidates(root, 0, 5);
+
+  // Three purposes x receive and change x five indices.
+  assert.equal(candidates.length, 30);
+  assert.ok(candidates.some((key) => key.path === "m/84'/0'/0'/1/0"), 'change chain must be scanned');
+  assert.ok(candidates.some((key) => key.path === "m/44'/0'/0'/1/4"));
+  assert.equal(new Set(candidates.map((key) => key.address)).size, 30, 'every derived address should be distinct');
+});
+
+test('looksLikeMnemonic separates a phrase from a key', () => {
+  assert.ok(looksLikeMnemonic(TEST_MNEMONIC));
+  assert.ok(looksLikeMnemonic('  abandon about  '));
+  assert.ok(!looksLikeMnemonic(WIF_KEY_ONE));
+  assert.ok(!looksLikeMnemonic(`0x${'a'.repeat(64)}`));
+});
+
+test('one transaction can spend inputs held by different derived keys', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+
+  // A receive address and a change address: exactly the spread that makes a
+  // single exported key insufficient for an HD wallet.
+  const receive = deriveBitcoinKey(root, 84, 0, 0, 0);
+  const change = deriveBitcoinKey(root, 84, 0, 1, 0);
+  assert.notEqual(receive.address, change.address);
+
+  const byAddress = new Map([
+    [receive.address, receive.node],
+    [change.address, change.node],
+  ]);
+
+  const utxos: SweepableUtxo[] = [
+    { txid: 'a'.repeat(64), vout: 0, value: 70_000n, scriptType: 'p2wpkh', address: receive.address },
+    { txid: 'b'.repeat(64), vout: 1, value: 30_000n, scriptType: 'p2wpkh', address: change.address },
+  ];
+
+  const vsize = estimateVsize(['p2wpkh', 'p2wpkh'], outputTypeOf(DEST_BECH32));
+  const { amount } = computeSweepAmount(100_000n, vsize, 8);
+
+  const psbt = buildSweepPsbt(utxos, DEST_BECH32, amount, new Map(), (address) =>
+    Buffer.from(byAddress.get(address)!.publicKey)
+  );
+
+  // Each input is signed by the key that controls its own address.
+  utxos.forEach((utxo, index) => psbt.signInput(index, byAddress.get(utxo.address)!));
+  assert.ok(psbt.validateSignaturesOfAllInputs(validator), 'both inputs should verify under their own key');
+
+  psbt.finalizeAllInputs();
+  const tx = psbt.extractTransaction();
+
+  assert.equal(tx.ins.length, 2);
+  assert.equal(tx.outs.length, 1);
+  assert.equal(tx.outs[0].value, Number(amount));
+  assert.ok(tx.virtualSize() <= vsize);
+});
+
+test('signing the wrong input with the wrong derived key fails verification', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+  const receive = deriveBitcoinKey(root, 84, 0, 0, 0);
+  const other = deriveBitcoinKey(root, 84, 0, 0, 1);
+
+  const utxos: SweepableUtxo[] = [
+    { txid: 'c'.repeat(64), vout: 0, value: 50_000n, scriptType: 'p2wpkh', address: receive.address },
+  ];
+
+  const psbt = buildSweepPsbt(utxos, DEST_BECH32, 45_000n, new Map(), () => Buffer.from(receive.node.publicKey));
+
+  // bitcoinjs refuses a key that does not match the input's script.
+  assert.throws(() => psbt.signInput(0, other.node), /Can not sign for this input/i);
+});

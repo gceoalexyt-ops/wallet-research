@@ -3,6 +3,7 @@ import { EVM_CHAINS } from '../chains/evm';
 import { ChainId } from '../chains/types';
 import { BitcoinSweeper } from './bitcoinSweeper';
 import { EvmSweeper } from './evmSweeper';
+import { deriveEvmKey, mnemonicToSeed, rootFromSeed } from './hdWallet';
 import { MIN_VALUE_THRESHOLD_USD, SweepPlan, SweepResult } from './types';
 
 const EVM_CHAIN_IDS = EVM_CHAINS.map((config) => config.chain);
@@ -16,6 +17,8 @@ interface SweepCliOptions {
   includeUnconfirmed: boolean;
   rpcUrl?: string;
   feeRate?: number;
+  account?: number;
+  gapLimit?: number;
   help: boolean;
 }
 
@@ -56,6 +59,12 @@ export function parseSweepArgs(argv: string[]): SweepCliOptions {
       case '--fee-rate':
         options.feeRate = parseFloat(argv[++i] ?? '') || undefined;
         break;
+      case '--account':
+        options.account = parseInt(argv[++i] ?? '', 10) || 0;
+        break;
+      case '--gap-limit':
+        options.gapLimit = parseInt(argv[++i] ?? '', 10) || undefined;
+        break;
       case '--help':
       case '-h':
         options.help = true;
@@ -83,9 +92,16 @@ function usage(): string {
     '  --include-unconfirmed    Bitcoin only: also spend unconfirmed outputs',
     '  --rpc <url>              EVM only: use a specific RPC endpoint',
     '  --fee-rate <sat/vB>      Bitcoin only: set the fee rate instead of asking the network',
+    '  --account <n>            Seed phrase only: which account to use (default: 0)',
+    '  --gap-limit <n>          Seed phrase only: consecutive unused addresses that end a scan (default: 20)',
     '  -h, --help               Show this help',
     '',
-    'The private key is only ever read from an interactive prompt, never from a',
+    'At the prompt you may enter either a single private key or a BIP39 seed',
+    'phrase. A seed phrase is the one that works for HD wallets such as Exodus:',
+    'on Bitcoin it scans BIP84, BIP49 and BIP44, receive and change, and sweeps',
+    'every funded address into one transaction. A single key covers one address.',
+    '',
+    'The key or phrase is only ever read from an interactive prompt, never from a',
     'flag or an environment variable, so it does not reach your shell history or',
     'the process list. Nothing is signed until you approve the printed plan.',
     '',
@@ -202,24 +218,50 @@ export function renderResult(result: SweepResult): string {
   return lines.join('\n');
 }
 
+/** A seed phrase is several words; a key is one token. */
+export function looksLikeMnemonic(secret: string): boolean {
+  return /\s/.test(secret.trim());
+}
+
 async function buildPlan(
   chain: ChainId,
-  privateKey: string,
+  secret: string,
+  passphrase: string,
   destination: string,
   options: SweepCliOptions
 ): Promise<{ plan: SweepPlan; execute: (plan: SweepPlan) => Promise<SweepResult> }> {
+  const fromSeed = looksLikeMnemonic(secret);
+
   if (chain === 'bitcoin') {
-    const sweeper = new BitcoinSweeper(privateKey, {
+    const bitcoinOptions = {
       minValueUsd: options.minValue,
       includeUnpriced: options.includeUnpriced,
       includeUnconfirmed: options.includeUnconfirmed,
       feeRate: options.feeRate,
-    });
+      account: options.account,
+      gapLimit: options.gapLimit,
+    };
+
+    const sweeper = fromSeed
+      ? BitcoinSweeper.fromMnemonic(secret, passphrase, bitcoinOptions)
+      : BitcoinSweeper.fromWif(secret, bitcoinOptions);
+
+    if (fromSeed) {
+      console.log(`Scanning account ${options.account ?? 0} across BIP84, BIP49 and BIP44, receive and change...`);
+    }
+
     return { plan: await sweeper.planSweep(destination), execute: (plan) => sweeper.executeSweep(plan) };
   }
 
   const config = EVM_CHAINS.find((entry) => entry.chain === chain);
   if (!config) throw new Error(`No EVM configuration for ${chain}`);
+
+  let privateKey = secret;
+  if (fromSeed) {
+    const derived = deriveEvmKey(rootFromSeed(mnemonicToSeed(secret, passphrase)), options.account ?? 0);
+    privateKey = derived.privateKey;
+    console.log(`Derived ${derived.address} at ${derived.path}.`);
+  }
 
   const sweeper = new EvmSweeper(privateKey, config, {
     rpcUrl: options.rpcUrl,
@@ -266,20 +308,29 @@ async function main(): Promise<void> {
     return;
   }
 
-  const privateKey = await secretQuestion(
-    chain === 'bitcoin' ? 'WIF private key (input hidden): ' : 'Private key, hex (input hidden): '
+  const secret = await secretQuestion(
+    chain === 'bitcoin'
+      ? 'WIF private key or seed phrase (input hidden): '
+      : 'Private key or seed phrase (input hidden): '
   );
-  if (!privateKey) {
-    console.error('A private key is required.');
+  if (!secret) {
+    console.error('A private key or seed phrase is required.');
     process.exitCode = 1;
     return;
+  }
+
+  // BIP39's optional 25th word. A wrong one does not error, it derives a
+  // different and empty wallet, so it is asked for rather than assumed.
+  let passphrase = '';
+  if (looksLikeMnemonic(secret)) {
+    passphrase = await secretQuestion('BIP39 passphrase, blank if none (input hidden): ');
   }
 
   let plan: SweepPlan;
   let execute: (plan: SweepPlan) => Promise<SweepResult>;
   try {
     console.log('\nReading balances and estimating fees...');
-    ({ plan, execute } = await buildPlan(chain, privateKey, destination, options));
+    ({ plan, execute } = await buildPlan(chain, secret, passphrase, destination, options));
   } catch (error) {
     console.error(`\nCould not build a plan: ${error instanceof Error ? error.message : error}`);
     process.exitCode = 1;

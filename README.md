@@ -115,9 +115,11 @@ npm run sweep -- --chain bitcoin --to bc1q...
 npm run sweep -- --chain base --to 0xAbC... --min-value 25
 ```
 
-The private key is read from a hidden interactive prompt only — never a flag, an
-argument, or an environment variable — so it does not reach your shell history
-or the process list. Nothing is signed until you approve the printed plan.
+It accepts either a single private key or a BIP39 seed phrase — the latter is
+what works for HD wallets such as Exodus (see below). Either is read from a
+hidden interactive prompt only, never a flag, an argument, or an environment
+variable, so it does not reach your shell history or the process list. Nothing
+is signed until you approve the printed plan.
 
 ### Options
 
@@ -166,18 +168,46 @@ or the process list. Nothing is signed until you approve the printed plan.
   balance changed between planning and broadcasting.
 - Unpriced assets are skipped by default rather than moved blind.
 
-### Limitation: one key, one address
+### Seed phrases and HD wallets
 
-The sweep takes a **single private key**, so it moves what that one key
-controls. Wallets that derive many addresses from a seed phrase (Exodus, and any
-multi-account MetaMask or Phantom setup) hold funds under keys this tool never
-sees — particularly on Bitcoin, where change outputs routinely land on freshly
-derived addresses. Sweeping one exported key from an HD wallet can therefore
-move only part of the balance.
+At the prompt you can enter **either a single private key or a BIP39 seed
+phrase**; input with spaces in it is treated as a phrase.
 
-Seed-phrase and extended-key (xprv) derivation is not implemented. Check the
-result against `npm run portfolio` before assuming a wallet is empty. Hardware
-wallets do not export keys at all and cannot be used here.
+This distinction matters for wallets like Exodus. They derive many addresses
+from one seed, and on Bitcoin every transaction routinely sends change to a
+freshly derived address. A single exported key controls a single address, so
+sweeping it moves part of the balance, reports success, and silently leaves the
+rest behind.
+
+Given a phrase, a Bitcoin sweep scans the account properly:
+
+- **All three account layouts** — BIP84 native segwit, BIP49 wrapped segwit,
+  BIP44 legacy — since a wallet may have used any of them.
+- **Receive and change chains both**, because change is where a used wallet
+  keeps most of its outputs.
+- **Gap-limit scanning** (20 consecutive unused addresses ends a chain, per
+  BIP44), judged on transaction history rather than current balance — an
+  address that was used and emptied does not end the scan.
+- Every funded address found is swept into **one transaction**, each input
+  signed by the key that controls it.
+
+On EVM chains a phrase derives `m/44'/60'/0'/0/{account}`, the layout MetaMask,
+Exodus and Phantom all use. The derived address is printed before anything runs.
+
+```bash
+npm run sweep -- --chain bitcoin --to bc1q...              # prompts for key or phrase
+npm run sweep -- --chain bitcoin --to bc1q... --account 1  # a different account
+```
+
+If the wallet has a BIP39 passphrase (the "25th word"), you are asked for it
+separately. An incorrect passphrase does not error — it derives a different,
+empty wallet — so if a scan finds nothing, check that first.
+
+**Still not covered:** only the account you name is scanned, so a wallet using
+several accounts needs a run per account. Extended private keys (xprv) are not
+accepted, only phrases. Hardware wallets do not export keys or phrases and
+cannot be used here. Check any sweep against `npm run portfolio` before assuming
+a wallet is empty.
 
 ---
 
