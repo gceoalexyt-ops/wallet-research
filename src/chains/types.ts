@@ -9,6 +9,8 @@
 
 export type ChainId =
   | 'bitcoin'
+  | 'litecoin'
+  | 'bitcoin-cash'
   | 'ethereum'
   | 'polygon'
   | 'arbitrum'

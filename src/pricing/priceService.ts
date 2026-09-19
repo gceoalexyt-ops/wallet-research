@@ -5,6 +5,8 @@ import { EVM_TOKENS, SOLANA_TOKENS } from '../chains/tokenRegistry';
 /** CoinGecko id for each chain's native asset. */
 const NATIVE_COINGECKO_IDS: Record<ChainId, string> = {
   bitcoin: 'bitcoin',
+  litecoin: 'litecoin',
+  'bitcoin-cash': 'bitcoin-cash',
   ethereum: 'ethereum',
   polygon: 'matic-network',
   arbitrum: 'ethereum',
@@ -16,6 +18,8 @@ const NATIVE_COINGECKO_IDS: Record<ChainId, string> = {
 /** Binance spot symbols, used when CoinGecko is unreachable or rate-limited. */
 const BINANCE_SYMBOLS: Record<string, string> = {
   bitcoin: 'BTCUSDT',
+  litecoin: 'LTCUSDT',
+  'bitcoin-cash': 'BCHUSDT',
   ethereum: 'ETHUSDT',
   solana: 'SOLUSDT',
   'matic-network': 'POLUSDT',

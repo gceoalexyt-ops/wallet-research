@@ -15,6 +15,19 @@ import {
 import { Transaction, Wallet, recoverAddress } from 'ethers';
 import { buildNativeTransfer, normalizeEvmDestination, normalizePrivateKey } from '../transfer/evmSweeper';
 import { SweepCandidate, SweepPlan, classifyAssets, withBuffer } from '../transfer/types';
+import { BitcoinAdapter } from '../chains/bitcoin';
+import { createAdapters, detectChains } from '../portfolio';
+import { utxoNetwork } from '../chains/utxoNetworks';
+import {
+  BchUtxo,
+  buildBchTransaction,
+  computeBchSweepAmount,
+  deriveBchKey,
+  estimateBchSize,
+  legacyAddressOf,
+  normalizeBchDestination,
+  stripPrefix,
+} from '../transfer/bitcoinCashSweeper';
 import { looksLikeMnemonic, renderPlan } from '../transfer/sweepCli';
 import {
   deriveBitcoinKey,
@@ -447,4 +460,226 @@ test('signing the wrong input with the wrong derived key fails verification', ()
 
   // bitcoinjs refuses a key that does not match the input's script.
   assert.throws(() => psbt.signInput(0, other.node), /Can not sign for this input/i);
+});
+
+// --- Litecoin -------------------------------------------------------------
+
+const LTC = utxoNetwork('litecoin');
+const BTC = utxoNetwork('bitcoin');
+
+test('Litecoin derives under coin type 2 with its own address prefixes', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+
+  const native = deriveBitcoinKey(root, 84, 0, 0, 0, LTC);
+  const wrapped = deriveBitcoinKey(root, 49, 0, 0, 0, LTC);
+  const legacy = deriveBitcoinKey(root, 44, 0, 0, 0, LTC);
+
+  assert.equal(native.path, "m/84'/2'/0'/0/0");
+  assert.match(native.address, /^ltc1q/);
+  assert.match(wrapped.address, /^M/, 'modern Litecoin P2SH uses version 0x32, giving an M prefix');
+  assert.match(legacy.address, /^L/);
+
+  // The same key encoded under Bitcoin's bytes must carry an identical
+  // payload: only the network bytes may differ, never the key handling.
+  const asBitcoin = bitcoin.payments.p2wpkh({
+    pubkey: Buffer.from(native.node.publicKey),
+    network: bitcoin.networks.bitcoin,
+  }).address!;
+  assert.equal(
+    bitcoin.address.fromBech32(native.address).data.toString('hex'),
+    bitcoin.address.fromBech32(asBitcoin).data.toString('hex')
+  );
+  assert.equal(bitcoin.address.fromBech32(native.address).prefix, 'ltc');
+});
+
+test('Litecoin and Bitcoin addresses are rejected on each other chain', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+  const ltcAddress = deriveBitcoinKey(root, 84, 0, 0, 0, LTC).address;
+
+  // Sending to the right-looking address on the wrong chain is unrecoverable,
+  // so each chain must refuse the other's addresses outright.
+  assert.throws(() => normalizeBitcoinDestination(DEST_BECH32, [], LTC.network), /not a valid mainnet address/i);
+  assert.throws(() => normalizeBitcoinDestination(ltcAddress, [], BTC.network), /not a valid mainnet address/i);
+  assert.equal(normalizeBitcoinDestination(ltcAddress, [], LTC.network), ltcAddress);
+  assert.throws(() => normalizeBitcoinDestination(ltcAddress, [ltcAddress], LTC.network), /already controls/);
+});
+
+test('outputTypeOf reads the version byte, not the prefix', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+  const wrapped = deriveBitcoinKey(root, 49, 0, 0, 0, LTC).address;
+
+  // Prefix matching would call this p2pkh and underpay the fee.
+  assert.equal(outputTypeOf(wrapped, LTC.network), 'p2sh');
+  assert.equal(outputTypeOf(deriveBitcoinKey(root, 44, 0, 0, 0, LTC).address, LTC.network), 'p2pkh');
+  assert.equal(outputTypeOf(deriveBitcoinKey(root, 84, 0, 0, 0, LTC).address, LTC.network), 'p2wpkh');
+});
+
+test('a Litecoin sweep signs offline exactly as a Bitcoin one does', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+  const key = deriveBitcoinKey(root, 84, 0, 0, 0, LTC);
+
+  const utxos: SweepableUtxo[] = [
+    { txid: 'd'.repeat(64), vout: 0, value: 500_000n, scriptType: 'p2wpkh', address: key.address },
+  ];
+  const destination = deriveBitcoinKey(root, 84, 0, 0, 1, LTC).address;
+
+  const vsize = estimateVsize(['p2wpkh'], outputTypeOf(destination, LTC.network));
+  const { amount } = computeSweepAmount(500_000n, vsize, LTC.fallbackFeeRate);
+
+  const psbt = buildSweepPsbt(
+    utxos,
+    destination,
+    amount,
+    new Map(),
+    () => Buffer.from(key.node.publicKey),
+    LTC.network
+  );
+  psbt.signInput(0, key.node);
+  assert.ok(psbt.validateSignaturesOfAllInputs(validator));
+
+  psbt.finalizeAllInputs();
+  const tx = psbt.extractTransaction();
+  assert.equal(tx.outs.length, 1);
+  assert.equal(bitcoin.address.fromOutputScript(tx.outs[0].script, LTC.network), destination);
+  assert.ok(tx.virtualSize() <= vsize);
+});
+
+test('the Litecoin adapter accepts only Litecoin addresses', () => {
+  const ltc = new BitcoinAdapter(undefined, LTC);
+  const btc = new BitcoinAdapter(undefined, BTC);
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+  const ltcAddress = deriveBitcoinKey(root, 84, 0, 0, 0, LTC).address;
+
+  assert.ok(ltc.isValidAddress(ltcAddress));
+  assert.ok(ltc.isValidAddress(deriveBitcoinKey(root, 44, 0, 0, 0, LTC).address));
+  assert.ok(ltc.isValidAddress(deriveBitcoinKey(root, 49, 0, 0, 0, LTC).address));
+
+  assert.ok(!ltc.isValidAddress(DEST_BECH32));
+  assert.ok(!ltc.isValidAddress(KEY_ONE_P2PKH));
+  assert.ok(!btc.isValidAddress(ltcAddress));
+  assert.ok(btc.isValidAddress(DEST_BECH32));
+});
+
+// --- Bitcoin Cash ---------------------------------------------------------
+
+test('Bitcoin Cash derives under coin type 145 and agrees with bitcoinjs on the key', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+  const derived = deriveBchKey(root, 0, 0, 0);
+
+  assert.equal(derived.path, "m/44'/145'/0'/0/0");
+  assert.match(derived.address, /^bitcoincash:q/);
+
+  // bitcore and bitcoinjs must agree on the hash160 behind the address.
+  const node = root.derivePath("m/44'/145'/0'/0/0");
+  const expected = bitcoin.crypto.hash160(Buffer.from(node.publicKey)).toString('hex');
+  assert.equal(legacyAddressOf(derived.address), bitcoin.address.toBase58Check(Buffer.from(expected, 'hex'), 0x00));
+});
+
+test('legacyAddressOf returns standard BCH legacy, not bitcore BitPay format', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+  const derived = deriveBchKey(root, 0, 0, 0);
+
+  // bitcore's own toLegacyAddress() emits a BitPay address (version 0x1c, C
+  // prefix) that most BCH wallets reject, so it is never surfaced.
+  assert.match(legacyAddressOf(derived.address), /^1/);
+  assert.match((derived.privateKey as { toAddress(): { toLegacyAddress(): string } }).toAddress().toLegacyAddress(), /^C/);
+});
+
+test('normalizeBchDestination demands CashAddr unless legacy is opted into', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+  const mine = deriveBchKey(root, 0, 0, 0).address;
+  const theirs = deriveBchKey(root, 0, 0, 1).address;
+
+  assert.equal(normalizeBchDestination(theirs, [mine]), theirs);
+  // A bare prefix-less CashAddr normalizes to the full URI form.
+  assert.equal(normalizeBchDestination(stripPrefix(theirs), [mine]), theirs);
+
+  // A legacy address is equally valid on Bitcoin, so it is refused by default.
+  const legacy = legacyAddressOf(theirs);
+  assert.throws(() => normalizeBchDestination(legacy, [mine]), /equally valid on Bitcoin/);
+  assert.equal(normalizeBchDestination(legacy, [mine], true), theirs);
+
+  assert.throws(() => normalizeBchDestination(mine, [mine]), /already controls/);
+  assert.throws(() => normalizeBchDestination('not-an-address', [mine]), /Not a valid Bitcoin Cash address/);
+});
+
+test('BCH sizing has no witness discount and guards the dust limit', () => {
+  // 10 overhead + 148 per input + 34 per output; no segwit anywhere.
+  assert.equal(estimateBchSize(1, 1), 192);
+  assert.equal(estimateBchSize(3, 1), 488);
+
+  const { amount, fee } = computeBchSweepAmount(100_000n, 192, 2);
+  assert.equal(fee, 384n);
+  assert.equal(amount, 99_616n);
+
+  assert.throws(() => computeBchSweepAmount(300n, 192, 2), /does not cover the/);
+  assert.throws(() => computeBchSweepAmount(900n, 192, 2), /dust limit/);
+});
+
+test('a BCH sweep signs with SIGHASH_FORKID and verifies offline', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+  const first = deriveBchKey(root, 0, 0, 0);
+  const second = deriveBchKey(root, 0, 1, 0);
+  const destination = deriveBchKey(root, 0, 0, 5).address;
+
+  const utxos: BchUtxo[] = [
+    { txid: 'e'.repeat(64), vout: 0, value: 100_000n, address: first.address },
+    { txid: 'f'.repeat(64), vout: 1, value: 50_000n, address: second.address },
+  ];
+
+  const keys = new Map([
+    [first.address, first.privateKey],
+    [second.address, second.privateKey],
+  ]);
+
+  const { amount, fee } = computeBchSweepAmount(150_000n, estimateBchSize(2, 1), 2);
+  const tx = buildBchTransaction(utxos, destination, amount, fee, (address) => keys.get(address));
+
+  assert.equal(tx.verify(), true);
+  assert.ok(tx.isFullySigned());
+  assert.equal(tx.outputs.length, 1, 'a sweep has no change output');
+  assert.equal(tx.outputs[0].satoshis, Number(amount));
+
+  // 0x41 is SIGHASH_ALL | SIGHASH_FORKID: the byte that makes this valid on
+  // BCH and invalid on Bitcoin. Plain SIGHASH_ALL (0x01) would be a bug.
+  for (const input of tx.inputs) {
+    const signature = input.script.chunks[0].buf!;
+    assert.equal(signature[signature.length - 1], 0x41);
+  }
+});
+
+test('buildBchTransaction refuses to sign an input it has no key for', () => {
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+  const known = deriveBchKey(root, 0, 0, 0);
+  const unknown = deriveBchKey(root, 0, 0, 9);
+
+  const utxos: BchUtxo[] = [{ txid: '1'.repeat(64), vout: 0, value: 100_000n, address: unknown.address }];
+
+  assert.throws(
+    () => buildBchTransaction(utxos, known.address, 99_000n, 1_000n, () => undefined),
+    /not fully signed|No key/i
+  );
+});
+
+test('address detection keeps the UTXO chains apart', () => {
+  const adapters = createAdapters();
+  const root = rootFromSeed(mnemonicToSeed(TEST_MNEMONIC));
+  const bch = deriveBchKey(root, 0, 0, 0).address;
+
+  assert.deepEqual(detectChains(DEST_BECH32, adapters), ['bitcoin']);
+  assert.deepEqual(detectChains(KEY_ONE_P2PKH, adapters), ['bitcoin']);
+
+  for (const purpose of [84, 49, 44]) {
+    assert.deepEqual(
+      detectChains(deriveBitcoinKey(root, purpose, 0, 0, 0, LTC).address, adapters),
+      ['litecoin'],
+      `BIP${purpose} Litecoin address should resolve only to Litecoin`
+    );
+  }
+
+  assert.deepEqual(detectChains(bch, adapters), ['bitcoin-cash']);
+  assert.deepEqual(detectChains(stripPrefix(bch), adapters), ['bitcoin-cash']);
+
+  // Solana base58 must not be swallowed by the UTXO format checks.
+  assert.deepEqual(detectChains('So11111111111111111111111111111111111111112', adapters), ['solana']);
 });

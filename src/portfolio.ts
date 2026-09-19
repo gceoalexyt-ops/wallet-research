@@ -1,7 +1,9 @@
 import { BitcoinAdapter } from './chains/bitcoin';
+import { BitcoinCashAdapter } from './chains/bitcoinCash';
 import { EVM_CHAINS, EvmAdapter } from './chains/evm';
 import { SolanaAdapter } from './chains/solana';
 import { AddressPortfolio, AssetBalance, ChainAdapter, ChainId, Portfolio } from './chains/types';
+import { utxoNetwork } from './chains/utxoNetworks';
 import { PriceService } from './pricing/priceService';
 
 export interface AddressQuery {
@@ -18,7 +20,9 @@ export interface PortfolioOptions {
 export function createAdapters(options: PortfolioOptions = {}): Map<ChainId, ChainAdapter> {
   const adapters = new Map<ChainId, ChainAdapter>();
 
-  adapters.set('bitcoin', new BitcoinAdapter());
+  adapters.set('bitcoin', new BitcoinAdapter(undefined, utxoNetwork('bitcoin')));
+  adapters.set('litecoin', new BitcoinAdapter(undefined, utxoNetwork('litecoin')));
+  adapters.set('bitcoin-cash', new BitcoinCashAdapter());
   adapters.set('solana', new SolanaAdapter(options.rpcUrls?.solana));
 
   for (const config of EVM_CHAINS) {
@@ -34,6 +38,8 @@ export function createAdapters(options: PortfolioOptions = {}): Map<ChainId, Cha
  * An EVM address is valid on every EVM chain at once, so this returns all of
  * them and lets the caller query each.
  */
+const UTXO_PREFIXED = /^(1|3|bc1|L|M|ltc1|bitcoincash:|[qp][023456789acdefghjklmnpqrstuvwxyz]{38,})/;
+
 export function detectChains(address: string, adapters: Map<ChainId, ChainAdapter>): ChainId[] {
   const value = address.trim();
   const matches: ChainId[] = [];
@@ -42,12 +48,11 @@ export function detectChains(address: string, adapters: Map<ChainId, ChainAdapte
     if (adapter.isValidAddress(value)) matches.push(chain);
   }
 
-  // Base58 Bitcoin and Solana addresses can both satisfy the other's format
-  // check. Bitcoin's version prefixes are the reliable discriminator.
-  if (matches.includes('solana') && matches.includes('bitcoin')) {
-    const looksBitcoin = /^(1|3|bc1)/.test(value);
-    const ambiguous: ChainId = looksBitcoin ? 'solana' : 'bitcoin';
-    return matches.filter((chain) => chain !== ambiguous);
+  // Base58 addresses on Solana and the UTXO chains can satisfy each other's
+  // format check. A recognised version prefix is the reliable discriminator,
+  // so when one is present Solana is dropped rather than guessed at.
+  if (matches.includes('solana') && matches.some((chain) => UTXO_PREFIXED.test(value) && chain !== 'solana')) {
+    return matches.filter((chain) => chain !== 'solana');
   }
 
   return matches;

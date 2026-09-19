@@ -1,13 +1,17 @@
 import * as readline from 'readline';
 import { EVM_CHAINS } from '../chains/evm';
 import { ChainId } from '../chains/types';
+import { BitcoinCashSweeper } from './bitcoinCashSweeper';
 import { BitcoinSweeper } from './bitcoinSweeper';
 import { EvmSweeper } from './evmSweeper';
 import { deriveEvmKey, mnemonicToSeed, rootFromSeed } from './hdWallet';
 import { MIN_VALUE_THRESHOLD_USD, SweepPlan, SweepResult } from './types';
 
 const EVM_CHAIN_IDS = EVM_CHAINS.map((config) => config.chain);
-const SWEEPABLE_CHAINS: ChainId[] = ['bitcoin', ...EVM_CHAIN_IDS];
+/** Bitcoin-style chains sharing the bitcoinjs implementation. */
+const UTXO_CHAIN_IDS: ChainId[] = ['bitcoin', 'litecoin'];
+
+const SWEEPABLE_CHAINS: ChainId[] = [...UTXO_CHAIN_IDS, 'bitcoin-cash', ...EVM_CHAIN_IDS];
 
 interface SweepCliOptions {
   chain?: ChainId;
@@ -15,6 +19,7 @@ interface SweepCliOptions {
   minValue: number;
   includeUnpriced: boolean;
   includeUnconfirmed: boolean;
+  allowLegacyDestination: boolean;
   rpcUrl?: string;
   feeRate?: number;
   account?: number;
@@ -27,6 +32,7 @@ export function parseSweepArgs(argv: string[]): SweepCliOptions {
     minValue: MIN_VALUE_THRESHOLD_USD,
     includeUnpriced: false,
     includeUnconfirmed: false,
+    allowLegacyDestination: false,
     help: false,
   };
 
@@ -52,6 +58,9 @@ export function parseSweepArgs(argv: string[]): SweepCliOptions {
         break;
       case '--include-unconfirmed':
         options.includeUnconfirmed = true;
+        break;
+      case '--allow-legacy-dest':
+        options.allowLegacyDestination = true;
         break;
       case '--rpc':
         options.rpcUrl = argv[++i];
@@ -85,13 +94,14 @@ function usage(): string {
     '  npm run sweep -- --chain <chain> --to <address> [options]',
     '',
     'Options:',
-    '  --chain <name>           bitcoin, ethereum, polygon, arbitrum, optimism, base',
+    '  --chain <name>           bitcoin, litecoin, bitcoin-cash, ethereum, polygon, arbitrum, optimism, base',
     '  --to <address>           Destination address',
     `  --min-value <usd>        Leave assets below this value behind (default: ${MIN_VALUE_THRESHOLD_USD})`,
     '  --include-unpriced       Also move assets no price source could value',
-    '  --include-unconfirmed    Bitcoin only: also spend unconfirmed outputs',
+    '  --include-unconfirmed    Bitcoin/Litecoin only: also spend unconfirmed outputs',
+    '  --allow-legacy-dest      Bitcoin Cash only: accept a legacy 1... destination address',
     '  --rpc <url>              EVM only: use a specific RPC endpoint',
-    '  --fee-rate <sat/vB>      Bitcoin only: set the fee rate instead of asking the network',
+    '  --fee-rate <sat/vB>      Bitcoin/Litecoin/BCH only: set the fee rate instead of asking the network',
     '  --account <n>            Seed phrase only: which account to use (default: 0)',
     '  --gap-limit <n>          Seed phrase only: consecutive unused addresses that end a scan (default: 20)',
     '  -h, --help               Show this help',
@@ -232,8 +242,30 @@ async function buildPlan(
 ): Promise<{ plan: SweepPlan; execute: (plan: SweepPlan) => Promise<SweepResult> }> {
   const fromSeed = looksLikeMnemonic(secret);
 
-  if (chain === 'bitcoin') {
+  if (chain === 'bitcoin-cash') {
+    const bchOptions = {
+      minValueUsd: options.minValue,
+      includeUnpriced: options.includeUnpriced,
+      feeRate: options.feeRate,
+      account: options.account,
+      gapLimit: options.gapLimit,
+      allowLegacyDestination: options.allowLegacyDestination,
+    };
+
+    const sweeper = fromSeed
+      ? BitcoinCashSweeper.fromMnemonic(secret, passphrase, bchOptions)
+      : BitcoinCashSweeper.fromWif(secret, bchOptions);
+
+    if (fromSeed) {
+      console.log(`Scanning Bitcoin Cash account ${options.account ?? 0} (BIP44, receive and change)...`);
+    }
+
+    return { plan: await sweeper.planSweep(destination), execute: (plan) => sweeper.executeSweep(plan) };
+  }
+
+  if (UTXO_CHAIN_IDS.includes(chain)) {
     const bitcoinOptions = {
+      chain,
       minValueUsd: options.minValue,
       includeUnpriced: options.includeUnpriced,
       includeUnconfirmed: options.includeUnconfirmed,
@@ -247,7 +279,9 @@ async function buildPlan(
       : BitcoinSweeper.fromWif(secret, bitcoinOptions);
 
     if (fromSeed) {
-      console.log(`Scanning account ${options.account ?? 0} across BIP84, BIP49 and BIP44, receive and change...`);
+      console.log(
+        `Scanning ${chain} account ${options.account ?? 0} across BIP84, BIP49 and BIP44, receive and change...`
+      );
     }
 
     return { plan: await sweeper.planSweep(destination), execute: (plan) => sweeper.executeSweep(plan) };
@@ -309,7 +343,7 @@ async function main(): Promise<void> {
   }
 
   const secret = await secretQuestion(
-    chain === 'bitcoin'
+    UTXO_CHAIN_IDS.includes(chain) || chain === 'bitcoin-cash'
       ? 'WIF private key or seed phrase (input hidden): '
       : 'Private key or seed phrase (input hidden): '
   );

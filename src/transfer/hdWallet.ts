@@ -16,7 +16,7 @@ import * as bip39 from 'bip39';
 import * as bitcoin from 'bitcoinjs-lib';
 import { computeAddress } from 'ethers';
 import * as ecc from 'tiny-secp256k1';
-import { BitcoinScriptType } from './bitcoinSweeper';
+import { UTXO_PURPOSES, UtxoNetworkConfig, UtxoScriptType, utxoNetwork } from '../chains/utxoNetworks';
 
 const bip32 = BIP32Factory(ecc);
 
@@ -24,18 +24,14 @@ const bip32 = BIP32Factory(ecc);
  * The three Bitcoin account layouts in general use, and the script type each
  * one implies. A wallet may have used any of them, so all three are scanned.
  */
-export const BITCOIN_PURPOSES: Array<{ purpose: number; scriptType: BitcoinScriptType; label: string }> = [
-  { purpose: 84, scriptType: 'p2wpkh', label: 'BIP84 native segwit' },
-  { purpose: 49, scriptType: 'p2sh-p2wpkh', label: 'BIP49 wrapped segwit' },
-  { purpose: 44, scriptType: 'p2pkh', label: 'BIP44 legacy' },
-];
+export const BITCOIN_PURPOSES = UTXO_PURPOSES;
 
 /** How many consecutive unused addresses end a scan, per BIP44. */
 export const DEFAULT_GAP_LIMIT = 20;
 
 export interface DerivedBitcoinKey {
   address: string;
-  scriptType: BitcoinScriptType;
+  scriptType: UtxoScriptType;
   path: string;
   node: BIP32Interface;
 }
@@ -89,9 +85,14 @@ export function rootFromSeed(seed: Buffer): BIP32Interface {
   return bip32.fromSeed(seed, bitcoin.networks.bitcoin);
 }
 
-/** Render one Bitcoin address path. */
-export function bitcoinPath(purpose: number, account: number, change: 0 | 1, index: number): string {
-  return `m/${purpose}'/0'/${account}'/${change}/${index}`;
+/**
+ * Render one address path.
+ *
+ * The coin type is what separates one chain's accounts from another's under
+ * the same seed: Bitcoin is 0, Litecoin 2, Bitcoin Cash 145.
+ */
+export function utxoPath(purpose: number, coinType: number, account: number, change: 0 | 1, index: number): string {
+  return `m/${purpose}'/${coinType}'/${account}'/${change}/${index}`;
 }
 
 /**
@@ -106,26 +107,28 @@ export function deriveBitcoinKey(
   purpose: number,
   account: number,
   change: 0 | 1,
-  index: number
+  index: number,
+  config: UtxoNetworkConfig = utxoNetwork('bitcoin')
 ): DerivedBitcoinKey {
-  const entry = BITCOIN_PURPOSES.find((candidate) => candidate.purpose === purpose);
+  const entry = UTXO_PURPOSES.find((candidate) => candidate.purpose === purpose);
   if (!entry) {
     throw new Error(`Unsupported derivation purpose: ${purpose}`);
   }
+  if (!config.scriptTypes.includes(entry.scriptType)) {
+    throw new Error(`${config.displayName} does not support ${entry.scriptType} (${entry.label}).`);
+  }
 
-  const path = bitcoinPath(purpose, account, change, index);
+  const path = utxoPath(purpose, config.coinType, account, change, index);
   const node = root.derivePath(path);
-  const pubkey = Buffer.from(node.publicKey);
-  const network = bitcoin.networks.bitcoin;
+  const address = addressForScriptType(Buffer.from(node.publicKey), entry.scriptType, config.network);
 
-  const address = addressForScriptType(pubkey, entry.scriptType, network);
   return { address, scriptType: entry.scriptType, path, node };
 }
 
 /** Build the address a pubkey takes under a given script type. */
 export function addressForScriptType(
   pubkey: Buffer,
-  scriptType: BitcoinScriptType,
+  scriptType: UtxoScriptType,
   network: bitcoin.Network = bitcoin.networks.bitcoin
 ): string {
   if (scriptType === 'p2pkh') {
@@ -168,14 +171,17 @@ export function deriveEvmKey(root: BIP32Interface, index = 0): DerivedEvmKey {
 export function enumerateBitcoinCandidates(
   root: BIP32Interface,
   account: number,
-  gapLimit: number = DEFAULT_GAP_LIMIT
+  gapLimit: number = DEFAULT_GAP_LIMIT,
+  config: UtxoNetworkConfig = utxoNetwork('bitcoin')
 ): DerivedBitcoinKey[] {
   const keys: DerivedBitcoinKey[] = [];
 
-  for (const { purpose } of BITCOIN_PURPOSES) {
+  for (const { purpose, scriptType } of UTXO_PURPOSES) {
+    if (!config.scriptTypes.includes(scriptType)) continue;
+
     for (const change of [0, 1] as const) {
       for (let index = 0; index < gapLimit; index++) {
-        keys.push(deriveBitcoinKey(root, purpose, account, change, index));
+        keys.push(deriveBitcoinKey(root, purpose, account, change, index, config));
       }
     }
   }

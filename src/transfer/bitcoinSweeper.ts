@@ -4,9 +4,10 @@ import * as bitcoin from 'bitcoinjs-lib';
 import { ECPairFactory } from 'ecpair';
 import * as ecc from 'tiny-secp256k1';
 import { scaleUnits } from '../chains/evm';
+import { ChainId } from '../chains/types';
 import { PriceService } from '../pricing/priceService';
+import { UTXO_PURPOSES, UtxoNetworkConfig, UtxoScriptType, utxoNetwork } from '../chains/utxoNetworks';
 import {
-  BITCOIN_PURPOSES,
   DEFAULT_GAP_LIMIT,
   addressForScriptType,
   deriveBitcoinKey,
@@ -25,21 +26,15 @@ import {
 bitcoin.initEccLib(ecc);
 const ECPair = ECPairFactory(ecc);
 
-/** Esplora-compatible endpoints, tried in order -- same defaults as the reader. */
-const DEFAULT_ENDPOINTS = ['https://mempool.space/api', 'https://blockstream.info/api'];
-
 /** Below this, an output is unspendable in practice and relays reject it. */
 const DUST_LIMIT_SATS = 546n;
 
-/** Used when no endpoint will quote a fee rate. */
-const FALLBACK_FEE_RATE = 10;
-
 /**
- * A single key can be encoded as several addresses. All three are swept
- * together so funds are not silently left behind under a script type the
- * operator forgot they used.
+ * A single key can be encoded as several addresses. All of the ones a chain
+ * supports are swept together so funds are not silently left behind under a
+ * script type the operator forgot they used.
  */
-export type BitcoinScriptType = 'p2wpkh' | 'p2sh-p2wpkh' | 'p2pkh';
+export type BitcoinScriptType = UtxoScriptType;
 
 /** Virtual size each input type contributes, in vbytes. */
 const INPUT_VSIZE: Record<BitcoinScriptType, number> = {
@@ -74,6 +69,8 @@ export interface SweepableUtxo {
 }
 
 export interface BitcoinSweepOptions extends SweepOptions {
+  /** Which Bitcoin-style chain to sweep. Defaults to Bitcoin. */
+  chain?: ChainId;
   endpoints?: string[];
   /** Override the fee rate in sat/vB instead of asking an endpoint. */
   feeRate?: number;
@@ -121,6 +118,7 @@ export class BitcoinSweeper {
   /** Addresses discovered so far, and how to sign for each. */
   private readonly known = new Map<string, KnownAddress>();
 
+  private readonly config: UtxoNetworkConfig;
   private readonly root?: BIP32Interface;
   private readonly account: number;
   private readonly gapLimit: number;
@@ -133,10 +131,11 @@ export class BitcoinSweeper {
   private readonly feeRateOverride?: number;
 
   private constructor(root: BIP32Interface | undefined, options: BitcoinSweepOptions) {
+    this.config = utxoNetwork(options.chain ?? 'bitcoin');
     this.root = root;
     this.account = options.account ?? 0;
     this.gapLimit = options.gapLimit ?? DEFAULT_GAP_LIMIT;
-    this.endpoints = options.endpoints ?? DEFAULT_ENDPOINTS;
+    this.endpoints = options.endpoints ?? this.config.endpoints;
     this.http = axios.create({ timeout: 20000 });
     this.prices = PriceService.getInstance();
     this.minValueUsd = options.minValueUsd ?? MIN_VALUE_THRESHOLD_USD;
@@ -153,12 +152,12 @@ export class BitcoinSweeper {
    */
   static fromWif(wif: string, options: BitcoinSweepOptions = {}): BitcoinSweeper {
     const sweeper = new BitcoinSweeper(undefined, options);
-    const keyPair = ECPair.fromWIF(wif.trim(), bitcoin.networks.bitcoin);
+    const keyPair = ECPair.fromWIF(wif.trim(), sweeper.config.network);
     const pubkey = Buffer.from(keyPair.publicKey);
     const signer: SweepSigner = { publicKey: pubkey, sign: (hash, lowR) => Buffer.from(keyPair.sign(hash, lowR)) };
 
-    for (const scriptType of ['p2wpkh', 'p2sh-p2wpkh', 'p2pkh'] as const) {
-      sweeper.known.set(addressForScriptType(pubkey, scriptType), { scriptType, signer });
+    for (const scriptType of sweeper.config.scriptTypes) {
+      sweeper.known.set(addressForScriptType(pubkey, scriptType, sweeper.config.network), { scriptType, signer });
     }
 
     return sweeper;
@@ -195,14 +194,15 @@ export class BitcoinSweeper {
     // self-send check has to come after it.
     const to = normalizeBitcoinDestination(
       destination,
-      this.addresses().map((entry) => entry.address)
+      this.addresses().map((entry) => entry.address),
+      this.config.network
     );
 
     if (utxos.length === 0) {
       throw new Error(
         this.isHd
-          ? `No ${this.includeUnconfirmed ? '' : 'confirmed '}outputs found across account ${this.account} ` +
-            `(scanned BIP84, BIP49 and BIP44, receive and change, gap limit ${this.gapLimit}).`
+          ? `No ${this.includeUnconfirmed ? '' : 'confirmed '}${this.config.displayName} outputs found across ` +
+            `account ${this.account} (scanned ${this.scannedLayouts()}, receive and change, gap limit ${this.gapLimit}).`
           : `No ${this.includeUnconfirmed ? '' : 'confirmed '}outputs found for this key across ` +
             this.addresses().map((entry) => entry.address).join(', ')
       );
@@ -210,16 +210,16 @@ export class BitcoinSweeper {
 
     const total = utxos.reduce((sum, utxo) => sum + utxo.value, 0n);
     const feeRate = this.feeRateOverride ?? (await this.fetchFeeRate());
-    const vsize = estimateVsize(utxos.map((utxo) => utxo.scriptType), outputTypeOf(to));
-    const { amount, fee } = computeSweepAmount(total, vsize, feeRate);
+    const vsize = estimateVsize(utxos.map((utxo) => utxo.scriptType), outputTypeOf(to, this.config.network));
+    const { amount, fee } = computeSweepAmount(total, vsize, feeRate, this.config.dustLimit);
 
-    const priceUsd = await this.btcPrice();
+    const priceUsd = await this.nativePrice();
     const amountBtc = scaleUnits(amount, 8);
     const valueUsd = priceUsd === null ? null : amountBtc * priceUsd;
 
     const asset: SweepCandidate = {
-      symbol: 'BTC',
-      name: 'Bitcoin',
+      symbol: this.config.nativeSymbol,
+      name: this.config.nativeName,
       decimals: 8,
       rawAmount: total,
       amount: scaleUnits(total, 8),
@@ -254,15 +254,18 @@ export class BitcoinSweeper {
         `Only account ${this.account} was scanned. If this wallet uses further accounts, their funds are not included.`
       );
     }
+    if (this.config.chain === 'litecoin') {
+      warnings.push('Litecoin and Bitcoin addresses look similar. Confirm the destination is a Litecoin address.');
+    }
     if (!this.includeUnconfirmed) {
       warnings.push('Unconfirmed outputs are excluded. Re-run with --include-unconfirmed to spend them too.');
     }
 
     return {
-      chain: 'bitcoin',
+      chain: this.config.chain,
       source: [...spread].join(', '),
       destination: to,
-      nativeSymbol: 'BTC',
+      nativeSymbol: this.config.nativeSymbol,
       transfers: [{ asset, rawAmount: amount, amount: amountBtc, valueUsd }],
       skipped: [],
       feeReserveRaw: fee,
@@ -298,7 +301,8 @@ export class BitcoinSweeper {
         plan.destination,
         transfer.rawAmount,
         prevTxs,
-        (address) => this.signerFor(address).publicKey
+        (address) => this.signerFor(address).publicKey,
+        this.config.network
       );
 
       // Inputs can come from different derived keys, so each is signed with
@@ -312,20 +316,28 @@ export class BitcoinSweeper {
       const txid = await this.broadcast(hex);
 
       const executed: ExecutedTransfer = {
-        symbol: 'BTC',
+        symbol: this.config.nativeSymbol,
         amount: transfer.amount,
         valueUsd: transfer.valueUsd,
         txHash: txid,
-        explorerUrl: `https://mempool.space/tx/${txid}`,
+        explorerUrl: `${this.config.explorerTxUrl}/${txid}`,
       };
 
-      return { success: true, chain: 'bitcoin', executed: [executed], failed: [], totalValueUsd: transfer.valueUsd ?? 0 };
+      return {
+        success: true,
+        chain: this.config.chain,
+        executed: [executed],
+        failed: [],
+        totalValueUsd: transfer.valueUsd ?? 0,
+      };
     } catch (error) {
       return {
         success: false,
-        chain: 'bitcoin',
+        chain: this.config.chain,
         executed: [],
-        failed: [{ symbol: 'BTC', error: error instanceof Error ? error.message : 'Unknown error' }],
+        failed: [
+          { symbol: this.config.nativeSymbol, error: error instanceof Error ? error.message : 'Unknown error' },
+        ],
         totalValueUsd: 0,
         error: error instanceof Error ? error.message : 'Unknown error',
       };
@@ -381,12 +393,14 @@ export class BitcoinSweeper {
   private async scanHdAccount(root: BIP32Interface): Promise<SweepableUtxo[]> {
     const collected: SweepableUtxo[] = [];
 
-    for (const { purpose } of BITCOIN_PURPOSES) {
+    for (const { purpose, scriptType } of UTXO_PURPOSES) {
+      if (!this.config.scriptTypes.includes(scriptType)) continue;
+
       for (const change of [0, 1] as const) {
         let unusedRun = 0;
 
         for (let index = 0; unusedRun < this.gapLimit && index < MAX_SCAN_INDEX; index++) {
-          const derived = deriveBitcoinKey(root, purpose, this.account, change, index);
+          const derived = deriveBitcoinKey(root, purpose, this.account, change, index, this.config);
 
           if ((await this.fetchTransactionCount(derived.address)) === 0) {
             unusedRun++;
@@ -434,12 +448,19 @@ export class BitcoinSweeper {
     }, `Could not read history for ${address}`);
   }
 
-  private async btcPrice(): Promise<number | null> {
+  /** Which derivation layouts this chain's scan covers, for messages. */
+  private scannedLayouts(): string {
+    return UTXO_PURPOSES.filter((entry) => this.config.scriptTypes.includes(entry.scriptType))
+      .map((entry) => `BIP${entry.purpose}`)
+      .join(', ');
+  }
+
+  private async nativePrice(): Promise<number | null> {
     const [priced] = await this.prices.priceAssets([
       {
-        chain: 'bitcoin',
-        symbol: 'BTC',
-        name: 'Bitcoin',
+        chain: this.config.chain,
+        symbol: this.config.nativeSymbol,
+        name: this.config.nativeName,
         amount: 1,
         rawAmount: '100000000',
         decimals: 8,
@@ -484,7 +505,7 @@ export class BitcoinSweeper {
         // Fall through to the next endpoint.
       }
     }
-    return FALLBACK_FEE_RATE;
+    return this.config.fallbackFeeRate;
   }
 
   private async broadcast(hex: string): Promise<string> {
@@ -517,13 +538,19 @@ export class BitcoinSweeper {
  * Check a destination is a spendable mainnet address the source key does not
  * already control.
  */
-export function normalizeBitcoinDestination(destination: string, ownAddresses: string[]): string {
+export function normalizeBitcoinDestination(
+  destination: string,
+  ownAddresses: string[],
+  network: bitcoin.Network = bitcoin.networks.bitcoin
+): string {
   const value = destination.trim();
 
+  // toOutputScript checks the address against this chain's own version bytes,
+  // so a Bitcoin address is rejected on Litecoin and vice versa.
   try {
-    bitcoin.address.toOutputScript(value, bitcoin.networks.bitcoin);
+    bitcoin.address.toOutputScript(value, network);
   } catch {
-    throw new Error(`Not a valid Bitcoin mainnet address: ${destination}`);
+    throw new Error(`Not a valid mainnet address for this chain: ${destination}`);
   }
 
   if (ownAddresses.includes(value)) {
@@ -543,9 +570,9 @@ export function buildSweepPsbt(
   destination: string,
   amount: bigint,
   parentTransactions: Map<string, Buffer>,
-  pubkeyFor: (address: string) => Buffer
+  pubkeyFor: (address: string) => Buffer,
+  network: bitcoin.Network = bitcoin.networks.bitcoin
 ): bitcoin.Psbt {
-  const network = bitcoin.networks.bitcoin;
   const psbt = new bitcoin.Psbt({ network });
 
   for (const utxo of utxos) {
@@ -615,11 +642,27 @@ export function computeSweepAmount(
   return { amount, fee };
 }
 
-/** Classify a destination address so its output size can be costed. */
-export function outputTypeOf(address: string): string {
+/**
+ * Classify a destination address so its output size can be costed.
+ *
+ * Decoding the address is used rather than matching its prefix, because the
+ * prefixes differ per chain -- Litecoin's wrapped-segwit addresses start with
+ * `M`, not `3` -- while the encoded version byte is authoritative.
+ */
+export function outputTypeOf(address: string, network: bitcoin.Network = bitcoin.networks.bitcoin): string {
   const value = address.trim();
-  if (/^bc1p/i.test(value)) return 'p2tr';
-  if (/^bc1q/i.test(value)) return value.length > 50 ? 'p2wsh' : 'p2wpkh';
-  if (/^3/.test(value)) return 'p2sh';
-  return 'p2pkh';
+
+  try {
+    const decoded = bitcoin.address.fromBech32(value);
+    if (decoded.version === 1 && decoded.data.length === 32) return 'p2tr';
+    return decoded.data.length === 32 ? 'p2wsh' : 'p2wpkh';
+  } catch {
+    // Not bech32; fall through to base58.
+  }
+
+  try {
+    return bitcoin.address.fromBase58Check(value).version === network.scriptHash ? 'p2sh' : 'p2pkh';
+  } catch {
+    return 'p2pkh';
+  }
 }

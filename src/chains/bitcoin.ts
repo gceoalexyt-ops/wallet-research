@@ -1,9 +1,8 @@
 import axios, { AxiosInstance } from 'axios';
+import * as bitcoin from 'bitcoinjs-lib';
 import { AssetBalance, ChainAdapter, ChainId } from './types';
 import { scaleUnits } from './evm';
-
-/** Esplora-compatible endpoints, tried in order. */
-const DEFAULT_ENDPOINTS = ['https://mempool.space/api', 'https://blockstream.info/api'];
+import { UtxoNetworkConfig, utxoNetwork } from './utxoNetworks';
 
 interface EsploraStats {
   funded_txo_sum: number;
@@ -16,35 +15,63 @@ interface EsploraAddress {
 }
 
 /**
- * Watch-only Bitcoin reader backed by public Esplora instances.
+ * Watch-only reader for a Bitcoin-style chain, backed by public Esplora
+ * instances.
+ *
+ * Bitcoin and Litecoin share this implementation; only the address prefixes
+ * and the API host differ, both of which come from the network config.
  *
  * Balance is derived from funded/spent output sums, with unconfirmed mempool
  * activity folded in so a just-sent transaction is reflected immediately.
  */
 export class BitcoinAdapter implements ChainAdapter {
-  readonly chain: ChainId = 'bitcoin';
-  readonly displayName = 'Bitcoin';
-  readonly nativeSymbol = 'BTC';
+  readonly chain: ChainId;
+  readonly displayName: string;
+  readonly nativeSymbol: string;
 
+  private readonly config: UtxoNetworkConfig;
   private readonly endpoints: string[];
   private readonly http: AxiosInstance;
 
-  constructor(endpoints: string[] = DEFAULT_ENDPOINTS) {
-    this.endpoints = endpoints;
+  constructor(endpoints?: string[], config: UtxoNetworkConfig = utxoNetwork('bitcoin')) {
+    this.config = config;
+    this.chain = config.chain;
+    this.displayName = config.displayName;
+    this.nativeSymbol = config.nativeSymbol;
+    this.endpoints = endpoints ?? config.endpoints;
     this.http = axios.create({ timeout: 20000 });
   }
 
+  /**
+   * Structural check against this chain's own version bytes.
+   *
+   * Decoding rather than prefix-matching keeps Bitcoin and Litecoin addresses
+   * from being accepted on each other's chain: their base58 versions differ,
+   * and their bech32 prefixes are `bc` and `ltc`.
+   */
   isValidAddress(address: string): boolean {
     const value = address.trim();
-    // P2PKH / P2SH base58, and bech32(m) v0-v1 segwit.
-    return /^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(value) || /^bc1[023456789acdefghjklmnpqrstuvwxyz]{11,71}$/.test(value.toLowerCase());
+
+    try {
+      const decoded = bitcoin.address.fromBech32(value);
+      return decoded.prefix === this.config.network.bech32;
+    } catch {
+      // Not bech32; fall through to base58.
+    }
+
+    try {
+      const { version } = bitcoin.address.fromBase58Check(value);
+      return version === this.config.network.pubKeyHash || version === this.config.network.scriptHash;
+    } catch {
+      return false;
+    }
   }
 
   async getBalances(address: string): Promise<AssetBalance[]> {
     const normalized = address.trim();
     if (!this.isValidAddress(normalized)) {
       throw new Error(
-        `Not a valid Bitcoin address: ${address}. ` +
+        `Not a valid ${this.displayName} address: ${address}. ` +
           'Extended public keys (xpub/ypub/zpub) are not supported yet -- pass individual addresses.'
       );
     }
@@ -59,8 +86,8 @@ export class BitcoinAdapter implements ChainAdapter {
     return [
       {
         chain: this.chain,
-        symbol: 'BTC',
-        name: 'Bitcoin',
+        symbol: this.config.nativeSymbol,
+        name: this.config.nativeName,
         amount: scaleUnits(satoshis, 8),
         rawAmount: satoshis.toString(),
         decimals: 8,
@@ -87,7 +114,8 @@ export class BitcoinAdapter implements ChainAdapter {
       }
     }
     throw new Error(
-      `Could not reach a Bitcoin API for ${address}: ${lastError instanceof Error ? lastError.message : 'all endpoints failed'}`
+      `Could not reach a ${this.displayName} API for ${address}: ` +
+        `${lastError instanceof Error ? lastError.message : 'all endpoints failed'}`
     );
   }
 }

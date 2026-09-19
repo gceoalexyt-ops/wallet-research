@@ -7,14 +7,14 @@ This repository contains three separate tools:
 | Tool | Entry point | Needs a private key? |
 |---|---|---|
 | **Multi-chain portfolio viewer** | `npm run portfolio` | No — public addresses only |
-| Multi-chain wallet sweep (BTC + EVM) | `npm run sweep` | Yes |
+| Multi-chain wallet sweep (UTXO + EVM) | `npm run sweep` | Yes |
 | Solana asset transfer | `npm start` | Yes |
 
 ---
 
 # Multi-chain Portfolio Viewer
 
-Read balances and USD valuations for your wallets across **Bitcoin, Ethereum, Polygon, Arbitrum, Optimism, Base, and Solana** — including native assets and major tokens such as **USDT, USDC, DAI, WBTC, and WETH**.
+Read balances and USD valuations for your wallets across **Bitcoin, Litecoin, Bitcoin Cash, Ethereum, Polygon, Arbitrum, Optimism, Base, and Solana** — including native assets and major tokens such as **USDT, USDC, DAI, WBTC, and WETH**.
 
 It takes **public addresses only**. It has no code path that can construct, sign, or broadcast a transaction, so you can point it at any wallet — hardware, cold storage, exchange deposit address — without exposing key material.
 
@@ -91,7 +91,7 @@ contract address, decimals, and CoinGecko id. Verify any contract address
 against the issuer or a block explorer before trusting a balance it produces.
 
 Extended public keys (xpub/ypub/zpub) are not supported yet — pass individual
-Bitcoin addresses.
+UTXO-chain addresses.
 
 ## Tests
 
@@ -105,13 +105,15 @@ npm run typecheck
 # Multi-chain Wallet Sweep
 
 Moves everything above a value threshold out of one wallet you hold the key for,
-into a destination you choose, on **Bitcoin, Ethereum, Polygon, Arbitrum,
-Optimism, and Base**. It is the same idea as the Solana mover below, extended to
-the chains the portfolio viewer reads.
+into a destination you choose, on **Bitcoin, Litecoin, Bitcoin Cash, Ethereum,
+Polygon, Arbitrum, Optimism, and Base**. It is the same idea as the Solana mover
+below, extended to the chains the portfolio viewer reads.
 
 ```bash
 npm run sweep -- --chain ethereum --to 0xAbC...
 npm run sweep -- --chain bitcoin --to bc1q...
+npm run sweep -- --chain litecoin --to ltc1q...
+npm run sweep -- --chain bitcoin-cash --to bitcoincash:q...
 npm run sweep -- --chain base --to 0xAbC... --min-value 25
 ```
 
@@ -125,13 +127,16 @@ is signed until you approve the printed plan.
 
 | Flag | Effect |
 |---|---|
-| `--chain <name>` | `bitcoin`, `ethereum`, `polygon`, `arbitrum`, `optimism`, `base` |
+| `--chain <name>` | `bitcoin`, `litecoin`, `bitcoin-cash`, `ethereum`, `polygon`, `arbitrum`, `optimism`, `base` |
 | `--to <address>` | Destination address |
 | `--min-value <usd>` | Leave assets below this value behind (default: 5) |
 | `--include-unpriced` | Also move assets no price source could value |
-| `--include-unconfirmed` | Bitcoin only: also spend unconfirmed outputs |
+| `--include-unconfirmed` | Bitcoin/Litecoin only: also spend unconfirmed outputs |
+| `--allow-legacy-dest` | Bitcoin Cash only: accept a legacy `1...` destination |
 | `--rpc <url>` | EVM only: use a specific RPC endpoint |
-| `--fee-rate <sat/vB>` | Bitcoin only: set the fee rate directly |
+| `--fee-rate <sat/vB>` | UTXO chains: set the fee rate directly |
+| `--account <n>` | Seed phrase only: which account to scan (default: 0) |
+| `--gap-limit <n>` | Seed phrase only: unused addresses that end a scan (default: 20) |
 
 ### How a sweep runs
 
@@ -153,9 +158,15 @@ is signed until you approve the printed plan.
 - **Optimism and Base** charge an L1 data fee on top of L2 gas. That fee is
   quoted from the on-chain gas oracle and added to the reserve; budgeting only
   `gasLimit * gasPrice` there would strand the native sweep.
-- **Bitcoin is one transaction** with no change output. All three address forms
-  a key can produce (P2PKH, P2SH-P2WPKH, P2WPKH) are swept together, so funds
-  are not left behind under a script type you had forgotten about.
+- **Bitcoin and Litecoin are one transaction** with no change output. All three
+  address forms a key can produce (P2PKH, P2SH-P2WPKH, P2WPKH) are swept
+  together, so funds are not left behind under a script type you had forgotten
+  about. Litecoin uses coin type 2 and its own network bytes, so its
+  wrapped-segwit addresses carry the modern `M` prefix rather than `3`.
+- **Bitcoin Cash is its own implementation.** BCH has no segwit, so only the
+  BIP44 legacy layout exists, and every input is signed with SIGHASH_FORKID
+  over a BIP143-style digest that bitcoinjs-lib cannot produce. It uses
+  bitcore-lib-cash instead, and CashAddr throughout.
 
 ### Safety rails
 
@@ -164,8 +175,13 @@ is signed until you approve the printed plan.
   destination equal to the source.
 - Signing is refused if the RPC reports a different chain id than expected.
 - A destination that is a contract rather than a wallet raises a warning.
-- Bitcoin refuses to produce an output below the dust limit, and aborts if the
-  balance changed between planning and broadcasting.
+- Bitcoin and Litecoin refuse to produce an output below the dust limit, and
+  abort if the balance changed between planning and broadcasting.
+- Each UTXO chain validates a destination against its **own** version bytes, so
+  a Bitcoin address is refused on Litecoin and vice versa.
+- Bitcoin Cash requires a **CashAddr** destination by default. A legacy `1...`
+  address is equally valid on Bitcoin, and there is no way to tell which chain
+  you meant; pass `--allow-legacy-dest` if you really intend one.
 - Unpriced assets are skipped by default rather than moved blind.
 
 ### Seed phrases and HD wallets
@@ -179,7 +195,7 @@ freshly derived address. A single exported key controls a single address, so
 sweeping it moves part of the balance, reports success, and silently leaves the
 rest behind.
 
-Given a phrase, a Bitcoin sweep scans the account properly:
+Given a phrase, a UTXO sweep scans the account properly:
 
 - **All three account layouts** — BIP84 native segwit, BIP49 wrapped segwit,
   BIP44 legacy — since a wallet may have used any of them.
@@ -191,11 +207,16 @@ Given a phrase, a Bitcoin sweep scans the account properly:
 - Every funded address found is swept into **one transaction**, each input
   signed by the key that controls it.
 
+Bitcoin Cash is scanned the same way but BIP44 only, since it has no segwit.
+Coin types differ per chain — Bitcoin 0, Litecoin 2, Bitcoin Cash 145 — so one
+phrase yields a separate account on each.
+
 On EVM chains a phrase derives `m/44'/60'/0'/0/{account}`, the layout MetaMask,
 Exodus and Phantom all use. The derived address is printed before anything runs.
 
 ```bash
 npm run sweep -- --chain bitcoin --to bc1q...              # prompts for key or phrase
+npm run sweep -- --chain litecoin --to ltc1q...            # same phrase, coin type 2
 npm run sweep -- --chain bitcoin --to bc1q... --account 1  # a different account
 ```
 

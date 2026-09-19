@@ -3,7 +3,7 @@ import { ChainId } from './chains/types';
 import { AddressQuery, createAdapters, detectChains, inspectPortfolio } from './portfolio';
 import { Portfolio } from './chains/types';
 
-const SUPPORTED_CHAINS: ChainId[] = ['bitcoin', 'ethereum', 'polygon', 'arbitrum', 'optimism', 'base', 'solana'];
+const SUPPORTED_CHAINS: ChainId[] = ['bitcoin', 'litecoin', 'bitcoin-cash', 'ethereum', 'polygon', 'arbitrum', 'optimism', 'base', 'solana'];
 
 interface CliOptions {
   addresses: string[];
