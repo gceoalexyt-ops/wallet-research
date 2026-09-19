@@ -2,11 +2,12 @@
 
 ⚠️ **LEGAL DISCLAIMER: This tool is for LEGITIMATE purposes only. Do NOT use for malicious activities, theft, or unauthorized access to wallets. Only use with wallets you own or have explicit permission to access.**
 
-This repository contains two separate tools:
+This repository contains three separate tools:
 
 | Tool | Entry point | Needs a private key? |
 |---|---|---|
 | **Multi-chain portfolio viewer** | `npm run portfolio` | No — public addresses only |
+| Multi-chain wallet sweep (BTC + EVM) | `npm run sweep` | Yes |
 | Solana asset transfer | `npm start` | Yes |
 
 ---
@@ -52,7 +53,9 @@ TOTAL: $14,130.00
 ## Design notes
 
 - **Read-only by construction.** The `ChainAdapter` interface exposes
-  `getBalances` and nothing else. There is no signing layer to misuse.
+  `getBalances` and nothing else. Adapters never accept or derive key material.
+  Everything that can move funds lives in `src/transfer`, behind its own
+  plan-then-confirm flow; the viewer cannot reach it.
 - **Unpriced assets are never guessed.** If no price source resolves an asset,
   it is reported as `unpriced` and excluded from the total rather than
   silently contributing a fabricated number.
@@ -96,6 +99,85 @@ Bitcoin addresses.
 npm test        # logic tests, no network required
 npm run typecheck
 ```
+
+---
+
+# Multi-chain Wallet Sweep
+
+Moves everything above a value threshold out of one wallet you hold the key for,
+into a destination you choose, on **Bitcoin, Ethereum, Polygon, Arbitrum,
+Optimism, and Base**. It is the same idea as the Solana mover below, extended to
+the chains the portfolio viewer reads.
+
+```bash
+npm run sweep -- --chain ethereum --to 0xAbC...
+npm run sweep -- --chain bitcoin --to bc1q...
+npm run sweep -- --chain base --to 0xAbC... --min-value 25
+```
+
+The private key is read from a hidden interactive prompt only — never a flag, an
+argument, or an environment variable — so it does not reach your shell history
+or the process list. Nothing is signed until you approve the printed plan.
+
+### Options
+
+| Flag | Effect |
+|---|---|
+| `--chain <name>` | `bitcoin`, `ethereum`, `polygon`, `arbitrum`, `optimism`, `base` |
+| `--to <address>` | Destination address |
+| `--min-value <usd>` | Leave assets below this value behind (default: 5) |
+| `--include-unpriced` | Also move assets no price source could value |
+| `--include-unconfirmed` | Bitcoin only: also spend unconfirmed outputs |
+| `--rpc <url>` | EVM only: use a specific RPC endpoint |
+| `--fee-rate <sat/vB>` | Bitcoin only: set the fee rate directly |
+
+### How a sweep runs
+
+1. **Plan.** Balances are read through the same watch-only adapters the
+   portfolio viewer uses, valued, and filtered against the threshold. Fees are
+   estimated and a reserve is set aside.
+2. **Review.** The plan prints what moves, what is being left behind and why,
+   the fee reserve, and how many transactions it will take.
+3. **Confirm.** You type the destination address back. Anything else cancels.
+4. **Execute.** Transactions are broadcast and each one's explorer link printed.
+
+### Chain differences that matter
+
+- **EVM is not atomic.** An EOA cannot batch unrelated transfers, so a sweep is
+  one transaction per token plus one for the native asset — not the single
+  transaction the Solana mover manages. If one fails the others still stand.
+- **The native asset goes last**, sized against a freshly read balance, because
+  the gas the token transfers actually burn is never exactly what was estimated.
+- **Optimism and Base** charge an L1 data fee on top of L2 gas. That fee is
+  quoted from the on-chain gas oracle and added to the reserve; budgeting only
+  `gasLimit * gasPrice` there would strand the native sweep.
+- **Bitcoin is one transaction** with no change output. All three address forms
+  a key can produce (P2PKH, P2SH-P2WPKH, P2WPKH) are swept together, so funds
+  are not left behind under a script type you had forgotten about.
+
+### Safety rails
+
+- The plan is read-only; nothing is signed before you confirm.
+- An EVM destination with a broken EIP-55 checksum is rejected, as is a
+  destination equal to the source.
+- Signing is refused if the RPC reports a different chain id than expected.
+- A destination that is a contract rather than a wallet raises a warning.
+- Bitcoin refuses to produce an output below the dust limit, and aborts if the
+  balance changed between planning and broadcasting.
+- Unpriced assets are skipped by default rather than moved blind.
+
+### Limitation: one key, one address
+
+The sweep takes a **single private key**, so it moves what that one key
+controls. Wallets that derive many addresses from a seed phrase (Exodus, and any
+multi-account MetaMask or Phantom setup) hold funds under keys this tool never
+sees — particularly on Bitcoin, where change outputs routinely land on freshly
+derived addresses. Sweeping one exported key from an HD wallet can therefore
+move only part of the balance.
+
+Seed-phrase and extended-key (xprv) derivation is not implemented. Check the
+result against `npm run portfolio` before assuming a wallet is empty. Hardware
+wallets do not export keys at all and cannot be used here.
 
 ---
 

@@ -9,6 +9,15 @@ export interface EvmChainConfig {
   nativeName: string;
   nativeCoingeckoId: string;
   defaultRpcUrl: string;
+  /** EIP-155 chain id, used when signing. Reading never needs it. */
+  chainId: number;
+  /** Block explorer root, for linking a broadcast transaction. */
+  explorerUrl: string;
+  /**
+   * OP-stack rollup: a transaction is charged an L1 data fee on top of the
+   * L2 gas it burns, so a sweep has to hold back more than gasLimit * gasPrice.
+   */
+  isOpStack?: boolean;
 }
 
 export const EVM_CHAINS: EvmChainConfig[] = [
@@ -19,6 +28,8 @@ export const EVM_CHAINS: EvmChainConfig[] = [
     nativeName: 'Ether',
     nativeCoingeckoId: 'ethereum',
     defaultRpcUrl: 'https://eth.llamarpc.com',
+    chainId: 1,
+    explorerUrl: 'https://etherscan.io',
   },
   {
     chain: 'polygon',
@@ -27,6 +38,8 @@ export const EVM_CHAINS: EvmChainConfig[] = [
     nativeName: 'Polygon Ecosystem Token',
     nativeCoingeckoId: 'matic-network',
     defaultRpcUrl: 'https://polygon-rpc.com',
+    chainId: 137,
+    explorerUrl: 'https://polygonscan.com',
   },
   {
     chain: 'arbitrum',
@@ -35,6 +48,8 @@ export const EVM_CHAINS: EvmChainConfig[] = [
     nativeName: 'Ether',
     nativeCoingeckoId: 'ethereum',
     defaultRpcUrl: 'https://arb1.arbitrum.io/rpc',
+    chainId: 42161,
+    explorerUrl: 'https://arbiscan.io',
   },
   {
     chain: 'optimism',
@@ -43,6 +58,9 @@ export const EVM_CHAINS: EvmChainConfig[] = [
     nativeName: 'Ether',
     nativeCoingeckoId: 'ethereum',
     defaultRpcUrl: 'https://mainnet.optimism.io',
+    chainId: 10,
+    explorerUrl: 'https://optimistic.etherscan.io',
+    isOpStack: true,
   },
   {
     chain: 'base',
@@ -51,6 +69,9 @@ export const EVM_CHAINS: EvmChainConfig[] = [
     nativeName: 'Ether',
     nativeCoingeckoId: 'ethereum',
     defaultRpcUrl: 'https://mainnet.base.org',
+    chainId: 8453,
+    explorerUrl: 'https://basescan.org',
+    isOpStack: true,
   },
 ];
 
